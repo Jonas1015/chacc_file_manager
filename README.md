@@ -145,13 +145,13 @@ No custom route is needed. The file manager provides this endpoint automatically
 As a ChaCC module, the file manager is installed like any other plugin:
 
 ```bash
-chacc add chacc-file-manager
+chacc add chacc_file_manager
 ```
 
 Or if building from source:
 
 ```bash
-chacc build chacc-file-manager.chacc
+chacc build chacc_file_manager.chacc
 ```
 
 After installation, the file service is available via:
