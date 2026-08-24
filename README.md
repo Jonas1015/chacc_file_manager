@@ -59,6 +59,9 @@ classDiagram
         +get_file(file_uuid, db_session) FileRecord
         +delete_file(file_uuid, db_session) bool
         +get_download_url(file_uuid, request, db_session) str
+        +get_content_url(file_uuid) str
+        +get_content_url_async(file_uuid, db_session) str
+        +get_base_url_prefix() str
         +register_adapter(adapter, name, set_default) void
     }
 
@@ -139,6 +142,37 @@ The endpoint handles:
 - `ETag` and `Cache-Control` headers (configurable cache TTL, revalidated via `ETag`)
 
 No custom route is needed. The file manager provides this endpoint automatically.
+
+## Generating Content URLs
+
+The file service provides methods to generate content URLs from file UUIDs without needing to know the URL structure:
+
+```python
+from .context_factory import get_module_context
+
+file_service = get_module_context().get_service("file_service")
+
+# Sync — construct URL from UUID (no DB needed)
+url = file_service.get_content_url(file_uuid)
+# Returns: "/files/{uuid}/content"
+
+# Async — construct URL using storage_key from DB record
+url = await file_service.get_content_url_async(file_uuid, db_session)
+# Returns: "/files/{storage_key}/content"
+
+# Get the module's base path prefix
+prefix = file_service.get_base_url_prefix()
+# Returns: "/files" (from module_meta.json)
+```
+
+### URL Structure
+
+URLs follow the pattern: `{base_path_prefix}/{storage_key}/content`
+
+- `base_path_prefix` — from `module_meta.json` (`/files` by default)
+- `storage_key` — typically the UUID (or `module/channel/uuid` if module mapping uses directories)
+
+Other modules should **never hardcode** the URL pattern. Always use these methods to ensure consistency if the route structure changes.
 
 ## Installation
 

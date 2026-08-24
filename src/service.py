@@ -4,6 +4,7 @@ import hashlib
 import asyncio
 import tempfile
 import os
+import json
 from pathlib import Path
 from typing import Optional, Union, AsyncIterable, List, Callable, Awaitable
 from abc import ABC, abstractmethod
@@ -20,6 +21,25 @@ from .exceptions import (
     InvalidContentTypeError,
     FileTooLargeError,
 )
+
+
+MODULE_META_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "module_meta.json")
+
+
+def get_base_url_prefix() -> str:
+    """Read base_path_prefix from module_meta.json. Sync, usable anywhere."""
+    try:
+        with open(MODULE_META_PATH, "r") as f:
+            meta = json.load(f)
+        return meta.get("base_path_prefix", "/files")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return "/files"
+
+
+def get_content_url(file_uuid: str) -> str:
+    """Construct content URL from UUID. Sync, no DB needed."""
+    base_prefix = get_base_url_prefix()
+    return f"{base_prefix}/{file_uuid}/content"
 
 
 def generate_checksum(content: bytes) -> str:
@@ -73,6 +93,21 @@ class BaseFileService(ABC):
 class FileService(BaseFileService):
     def __init__(self):
         pass
+
+    def get_base_url_prefix(self) -> str:
+        """Return the module's base path prefix for URL construction."""
+        return get_base_url_prefix()
+
+    def get_content_url(self, file_uuid: str) -> str:
+        """Construct content URL from UUID. Sync, no DB needed."""
+        base_prefix = get_base_url_prefix()
+        return f"{base_prefix}/{file_uuid}/content"
+
+    async def get_content_url_async(self, file_uuid: str, db_session) -> str:
+        """Generate content URL for a file. Async, uses DB to get storage_key."""
+        record = await self.get_file(file_uuid, db_session)
+        base_prefix = get_base_url_prefix()
+        return f"{base_prefix}/{record.storage_key}/content"
 
     async def _resolve_adapter(self, module_name: str, adapter_name: Optional[str], db_session: Session):
         if adapter_name and adapter_name in AdapterRegistry._adapters:
@@ -382,6 +417,12 @@ class FileService(BaseFileService):
         record = await self.get_file(file_uuid, db_session)
         adapter = AdapterRegistry.get(record.adapter_name)
         return await adapter.get_url(record.storage_key, request)
+
+    async def get_content_url_async(self, file_uuid: str, db_session) -> str:
+        """Generate content URL for a file. Async, uses DB to get storage_key."""
+        record = await self.get_file(file_uuid, db_session)
+        base_prefix = get_base_url_prefix()
+        return f"{base_prefix}/{record.storage_key}/content"
 
     async def register_adapter(self, adapter: BaseAdapter, name: str, set_default: bool = False):
         AdapterRegistry.register(adapter, name=name, set_default=set_default)
