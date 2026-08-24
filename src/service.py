@@ -8,9 +8,9 @@ import json
 from pathlib import Path
 from typing import Optional, Union, AsyncIterable, List, Callable, Awaitable
 from abc import ABC, abstractmethod
-from fastapi import Request, UploadFile
+from fastapi import Request, UploadFile, HTTPException
 from starlette.datastructures import UploadFile as StarletteUploadFile
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from .context_factory import get_module_context
@@ -42,7 +42,9 @@ def get_content_url(file_uuid: str) -> str:
     return f"{base_prefix}/{file_uuid}/content"
 
 
-def generate_checksum(content: bytes) -> str:
+def generate_checksum(content: bytes, module: str = "", include_module: bool = True) -> str:
+    if include_module and module:
+        return hashlib.sha256(module.encode() + content).hexdigest()
     return hashlib.sha256(content).hexdigest()
 
 
@@ -64,6 +66,8 @@ class BaseFileService(ABC):
         adapter_name: Optional[str] = None,
         created_by_user_id: Optional[int] = None,
         validation_hooks: Optional[List[Callable[[Union[bytes, Path], dict, bool], Awaitable[None]]]] = None,
+        allow_duplicate: bool = False,
+        include_checksum_module: bool = True,
     ) -> FileRecord:
         pass
 
@@ -134,17 +138,21 @@ class FileService(BaseFileService):
         self,
         content: bytes,
         max_file_size: int,
+        module: str = "",
+        include_checksum_module: bool = True,
     ) -> tuple[str, int, bytes]:
         if len(content) > max_file_size:
             raise FileTooLargeError(f"File exceeds {max_file_size} bytes limit")
 
-        checksum = await asyncio.to_thread(generate_checksum, content)
+        checksum = await asyncio.to_thread(generate_checksum, content, module, include_checksum_module)
         return checksum, len(content), content
 
     async def _process_stream(
         self,
         stream: AsyncIterable[bytes],
         max_file_size: int,
+        module: str = "",
+        include_checksum_module: bool = True,
     ) -> tuple[str, int, Path]:
         temp_path = None
         try:
@@ -152,6 +160,8 @@ class FileService(BaseFileService):
                 temp_path = Path(tmp.name)
 
             sha = hashlib.sha256()
+            if include_checksum_module and module:
+                sha.update(module.encode())
             file_size = 0
             async with aiofiles.open(temp_path, "wb") as af:
                 async for chunk in stream:
@@ -174,15 +184,13 @@ class FileService(BaseFileService):
             raise
 
     async def _check_duplicate(
-        self, db_session: Session, checksum: str, created_by_module: str
+        self, db_session: Session, checksum: str, created_by_module: str, include_module: bool = True
     ) -> Optional[FileRecord]:
         def _query():
-            result = db_session.execute(
-                select(FileRecord).where(
-                    FileRecord.checksum == checksum,
-                    FileRecord.created_by_module == created_by_module,
-                )
-            )
+            stmt = select(FileRecord).where(FileRecord.checksum == checksum)
+            if not include_module:
+                stmt = stmt.where(FileRecord.created_by_module == created_by_module)
+            result = db_session.execute(stmt)
             return result.scalars().first()
 
         return await asyncio.to_thread(_query)
@@ -232,6 +240,8 @@ class FileService(BaseFileService):
         adapter_name: Optional[str] = None,
         created_by_user_id: Optional[int] = None,
         validation_hooks: Optional[List[Callable[[Union[bytes, Path], dict, bool], Awaitable[None]]]] = None,
+        allow_duplicate: bool = False,
+        include_checksum_module: bool = True,
     ) -> FileRecord:
         if db_session is None:
             raise ValueError("Database session is required")
@@ -271,7 +281,7 @@ class FileService(BaseFileService):
                 file_size = file.size
                 content_bytes = await file.read()
                 checksum, file_size, content_bytes = await self._process_bytes(
-                    content_bytes, max_file_size
+                    content_bytes, max_file_size, created_by_module, include_checksum_module
                 )
                 validation_payload = content_bytes
                 validation_is_path = False
@@ -289,19 +299,19 @@ class FileService(BaseFileService):
                         yield chunk
 
                 checksum, file_size, temp_path = await self._process_stream(
-                    _stream_reader(), max_file_size
+                    _stream_reader(), max_file_size, created_by_module, include_checksum_module
                 )
                 validation_payload = temp_path
                 validation_is_path = True
         elif isinstance(file, bytes):
             checksum, file_size, content_bytes = await self._process_bytes(
-                file, max_file_size
+                file, max_file_size, created_by_module, include_checksum_module
             )
             validation_payload = content_bytes
             validation_is_path = False
         else:
             checksum, file_size, temp_path = await self._process_stream(
-                file, max_file_size
+                file, max_file_size, created_by_module, include_checksum_module
             )
             validation_payload = temp_path
             validation_is_path = True
@@ -309,33 +319,26 @@ class FileService(BaseFileService):
         for hook in (validation_hooks or []):
             await hook(validation_payload, {}, validation_is_path)
 
-        existing = await self._check_duplicate(db_session, checksum, created_by_module)
+        existing = await self._check_duplicate(db_session, checksum, created_by_module, include_checksum_module)
         if existing:
+            if not allow_duplicate:
+                raise HTTPException(
+                    status_code=409,
+                    detail="File already exists",
+                )
+
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.unlink(temp_path)
                 except Exception:
                     pass
 
-            new_record = FileRecord(
-                uuid=str(uuid_utils.uuid7()),
-                adapter_name=existing.adapter_name,
-                module_dir=existing.module_dir,
-                channel=existing.channel,
-                filename=safe_filename,
-                content_type=content_type,
-                size=file_size,
-                storage_key=existing.storage_key,
-                created_by_module=created_by_module,
-                checksum=checksum,
-            )
-            if hasattr(new_record, "created_by_id"):
-                new_record.created_by_id = created_by_user_id
-
-            db_session.add(new_record)
-            db_session.flush()
-            db_session.refresh(new_record)
-            return new_record
+            storage_key = str(uuid_utils.uuid7())
+            use_module_dir = bool(mapping and mapping.use_module_dir)
+            if use_module_dir:
+                storage_key = f"{created_by_module}/{storage_key}"
+                if channel:
+                    storage_key = f"{created_by_module}/{channel}/{storage_key}"
 
         if temp_path and os.path.exists(temp_path):
             metadata = await adapter.save(storage_key, temp_path, content_type)
@@ -391,12 +394,26 @@ class FileService(BaseFileService):
         if record is None:
             return False
 
-        try:
-            await AdapterRegistry.get(record.adapter_name).delete(str(record.storage_key))
-        except Exception:
-            pass
+        def _count_references(storage_key: str, exclude_uuid: str):
+            result = db_session.execute(
+                select(func.count()).where(
+                    FileRecord.storage_key == storage_key,
+                    FileRecord.uuid != exclude_uuid,
+                )
+            )
+            return result.scalar() or 0
 
-        def _delete_and_commit(target_uuid: str):
+        ref_count = await asyncio.to_thread(
+            _count_references, str(record.storage_key), file_uuid
+        )
+
+        if ref_count == 0:
+            try:
+                await AdapterRegistry.get(record.adapter_name).delete(str(record.storage_key))
+            except Exception:
+                pass
+
+        def _delete_record(target_uuid: str):
             target = db_session.execute(
                 select(FileRecord).where(FileRecord.uuid == target_uuid)
             ).scalar_one_or_none()
@@ -405,7 +422,7 @@ class FileService(BaseFileService):
                 db_session.flush()
             return True
 
-        return await asyncio.to_thread(_delete_and_commit, file_uuid)
+        return await asyncio.to_thread(_delete_record, file_uuid)
 
     async def get_download_url(
         self,
