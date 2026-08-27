@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from fastapi import Request, UploadFile, HTTPException
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from sqlalchemy import select, func
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from .context_factory import get_module_context
 from .models import FileRecord, ModuleAdapterMapping
@@ -62,7 +62,7 @@ class BaseFileService(ABC):
         content_type: str,
         created_by_module: str,
         channel: Optional[str] = None,
-        db_session: Session = None,
+        db_session: AsyncSession = None,
         adapter_name: Optional[str] = None,
         created_by_user_id: Optional[int] = None,
         validation_hooks: Optional[List[Callable[[Union[bytes, Path], dict, bool], Awaitable[None]]]] = None,
@@ -72,11 +72,11 @@ class BaseFileService(ABC):
         pass
 
     @abstractmethod
-    async def get_file(self, file_uuid: str, db_session: Session) -> FileRecord:
+    async def get_file(self, file_uuid: str, db_session: AsyncSession) -> FileRecord:
         pass
 
     @abstractmethod
-    async def delete_file(self, file_uuid: str, db_session: Session) -> bool:
+    async def delete_file(self, file_uuid: str, db_session: AsyncSession) -> bool:
         pass
 
     @abstractmethod
@@ -84,7 +84,7 @@ class BaseFileService(ABC):
         self,
         file_uuid: str,
         request: Request,
-        db_session,
+        db_session: AsyncSession,
         download: bool = False,
     ) -> str:
         pass
@@ -107,25 +107,18 @@ class FileService(BaseFileService):
         base_prefix = get_base_url_prefix()
         return f"{base_prefix}/{file_uuid}/content"
 
-    async def get_content_url_async(self, file_uuid: str, db_session) -> str:
-        """Generate content URL for a file. Async, uses DB to get storage_key."""
-        record = await self.get_file(file_uuid, db_session)
-        base_prefix = get_base_url_prefix()
-        return f"{base_prefix}/{record.storage_key}/content"
-
-    async def _resolve_adapter(self, module_name: str, adapter_name: Optional[str], db_session: Session):
+    async def _resolve_adapter(self, module_name: str, adapter_name: Optional[str], db_session: AsyncSession):
         if adapter_name and adapter_name in AdapterRegistry._adapters:
             return AdapterRegistry.get(adapter_name), None
 
-        def _query():
-            if db_session:
-                result = db_session.execute(
-                    select(ModuleAdapterMapping).where(ModuleAdapterMapping.module_name == module_name)
-                )
-                return result.scalar_one_or_none()
-            return None
+        if db_session:
+            result = await db_session.execute(
+                select(ModuleAdapterMapping).where(ModuleAdapterMapping.module_name == module_name)
+            )
+            mapping = result.scalar_one_or_none()
+        else:
+            mapping = None
 
-        mapping = await asyncio.to_thread(_query)
         if mapping and mapping.adapter_name in AdapterRegistry._adapters:
             return AdapterRegistry.get(mapping.adapter_name), mapping
 
@@ -144,7 +137,7 @@ class FileService(BaseFileService):
         if len(content) > max_file_size:
             raise FileTooLargeError(f"File exceeds {max_file_size} bytes limit")
 
-        checksum = await asyncio.to_thread(generate_checksum, content, module, include_checksum_module)
+        checksum = generate_checksum(content, module, include_checksum_module)
         return checksum, len(content), content
 
     async def _process_stream(
@@ -184,16 +177,13 @@ class FileService(BaseFileService):
             raise
 
     async def _check_duplicate(
-        self, db_session: Session, checksum: str, created_by_module: str, include_module: bool = True
+        self, db_session: AsyncSession, checksum: str, created_by_module: str, include_module: bool = True
     ) -> Optional[FileRecord]:
-        def _query():
-            stmt = select(FileRecord).where(FileRecord.checksum == checksum)
-            if not include_module:
-                stmt = stmt.where(FileRecord.created_by_module == created_by_module)
-            result = db_session.execute(stmt)
-            return result.scalars().first()
-
-        return await asyncio.to_thread(_query)
+        stmt = select(FileRecord).where(FileRecord.checksum == checksum)
+        if not include_module:
+            stmt = stmt.where(FileRecord.created_by_module == created_by_module)
+        result = await db_session.execute(stmt)
+        return result.scalars().first()
 
     def _get_config(self) -> dict:
         context = get_module_context()
@@ -236,7 +226,7 @@ class FileService(BaseFileService):
         content_type: str,
         created_by_module: str,
         channel: Optional[str] = None,
-        db_session: Session = None,
+        db_session: AsyncSession = None,
         adapter_name: Optional[str] = None,
         created_by_user_id: Optional[int] = None,
         validation_hooks: Optional[List[Callable[[Union[bytes, Path], dict, bool], Awaitable[None]]]] = None,
@@ -367,45 +357,34 @@ class FileService(BaseFileService):
             record.created_by_id = created_by_user_id
 
         db_session.add(record)
-        db_session.flush()
-        db_session.refresh(record)
+        await db_session.flush()
+        await db_session.refresh(record)
         return record
 
-    async def get_file(self, file_uuid: str, db_session) -> FileRecord:
-        def _do():
-            result = db_session.execute(
-                select(FileRecord).where(FileRecord.uuid == file_uuid)
-            )
-            return result.scalar_one_or_none()
-
-        record = await asyncio.to_thread(_do)
+    async def get_file(self, file_uuid: str, db_session: AsyncSession) -> FileRecord:
+        result = await db_session.execute(
+            select(FileRecord).where(FileRecord.uuid == file_uuid)
+        )
+        record = result.scalar_one_or_none()
         if record is None:
             raise FileNotFound(f"File {file_uuid} not found")
         return record
 
-    async def delete_file(self, file_uuid: str, db_session: Session) -> bool:
-        def _get_record():
-            result = db_session.execute(
-                select(FileRecord).where(FileRecord.uuid == file_uuid)
-            )
-            return result.scalar_one_or_none()
-
-        record = await asyncio.to_thread(_get_record)
+    async def delete_file(self, file_uuid: str, db_session: AsyncSession) -> bool:
+        result = await db_session.execute(
+            select(FileRecord).where(FileRecord.uuid == file_uuid)
+        )
+        record = result.scalar_one_or_none()
         if record is None:
             return False
 
-        def _count_references(storage_key: str, exclude_uuid: str):
-            result = db_session.execute(
-                select(func.count()).where(
-                    FileRecord.storage_key == storage_key,
-                    FileRecord.uuid != exclude_uuid,
-                )
+        result = await db_session.execute(
+            select(func.count()).where(
+                FileRecord.storage_key == record.storage_key,
+                FileRecord.uuid != file_uuid,
             )
-            return result.scalar() or 0
-
-        ref_count = await asyncio.to_thread(
-            _count_references, str(record.storage_key), file_uuid
         )
+        ref_count = result.scalar() or 0
 
         if ref_count == 0:
             try:
@@ -413,33 +392,25 @@ class FileService(BaseFileService):
             except Exception:
                 pass
 
-        def _delete_record(target_uuid: str):
-            target = db_session.execute(
-                select(FileRecord).where(FileRecord.uuid == target_uuid)
-            ).scalar_one_or_none()
-            if target:
-                db_session.delete(target)
-                db_session.flush()
-            return True
-
-        return await asyncio.to_thread(_delete_record, file_uuid)
+        result = await db_session.execute(
+            select(FileRecord).where(FileRecord.uuid == file_uuid)
+        )
+        target = result.scalar_one_or_none()
+        if target:
+            db_session.delete(target)
+            await db_session.flush()
+        return True
 
     async def get_download_url(
         self,
         file_uuid: str,
         request: Request,
-        db_session,
+        db_session: AsyncSession,
         download: bool = False,
     ) -> str:
         record = await self.get_file(file_uuid, db_session)
         adapter = AdapterRegistry.get(record.adapter_name)
         return await adapter.get_url(record.storage_key, request)
-
-    async def get_content_url_async(self, file_uuid: str, db_session) -> str:
-        """Generate content URL for a file. Async, uses DB to get storage_key."""
-        record = await self.get_file(file_uuid, db_session)
-        base_prefix = get_base_url_prefix()
-        return f"{base_prefix}/{record.storage_key}/content"
 
     async def register_adapter(self, adapter: BaseAdapter, name: str, set_default: bool = False):
         AdapterRegistry.register(adapter, name=name, set_default=set_default)

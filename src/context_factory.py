@@ -7,7 +7,6 @@ from fastapi import HTTPException
 from chacc_api import BackboneContext
 
 
-# Module-level context holder (set by main.py after setup_plugin is called)
 _module_context: Optional[BackboneContext] = None
 
 
@@ -74,6 +73,14 @@ async def get_db():
     if context is None:
         raise HTTPException(status_code=500, detail="Module not initialized")
     return await anext(context.get_db())
+
+
+async def get_async_db():
+    """Get async database session from module context."""
+    context = get_module_context()
+    if context is None:
+        raise HTTPException(status_code=500, detail="Module not initialized")
+    return await anext(context.get_db_async())
 
 
 async def get_redis_client():

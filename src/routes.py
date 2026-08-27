@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 import os
 
-from .context_factory import get_db, get_module_context
+from .context_factory import get_async_db, get_module_context
 from .models import FileRecord, ModuleAdapterMapping
 from .service import FileService
 from .adapters.base import AdapterRegistry
@@ -36,16 +36,16 @@ async def get_adapter(name: str):
 
 
 @router.get("/module-mappings", response_model=List[dict])
-async def list_module_mappings(db=Depends(get_db)):
+async def list_module_mappings(db=Depends(get_async_db)):
     """List all module-to-adapter mappings."""
     from sqlalchemy import select
-    result = db.execute(select(ModuleAdapterMapping))
+    result = await db.execute(select(ModuleAdapterMapping))
     mappings = result.scalars().all()
     return [{"module_name": m.module_name, "adapter_name": m.adapter_name, "use_module_dir": m.use_module_dir} for m in mappings]
 
 
 @router.post("/module-mappings", status_code=status.HTTP_201_CREATED)
-async def create_module_mapping(mapping: ModuleMappingCreate, db=Depends(get_db)):
+async def create_module_mapping(mapping: ModuleMappingCreate, db=Depends(get_async_db)):
     """Create module-to-adapter mapping."""
     if mapping.adapter_name not in AdapterRegistry._adapters:
         raise HTTPException(status_code=400, detail="Adapter not registered")
@@ -56,19 +56,19 @@ async def create_module_mapping(mapping: ModuleMappingCreate, db=Depends(get_db)
         description=mapping.description,
     )
     db.add(db_mapping)
-    db.commit()
+    await db.commit()
     return {"module_name": db_mapping.module_name, "adapter_name": db_mapping.adapter_name, "use_module_dir": db_mapping.use_module_dir}
 
 
 @router.delete("/module-mappings/{module_name}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_module_mapping(module_name: str, db=Depends(get_db)):
+async def delete_module_mapping(module_name: str, db=Depends(get_async_db)):
     """Delete module-to-adapter mapping."""
     from sqlalchemy import select
-    result = db.execute(select(ModuleAdapterMapping).where(ModuleAdapterMapping.module_name == module_name))
+    result = await db.execute(select(ModuleAdapterMapping).where(ModuleAdapterMapping.module_name == module_name))
     mapping = result.scalar_one_or_none()
     if mapping:
         db.delete(mapping)
-        db.commit()
+        await db.commit()
 
 
 @router.get("/{uuid}/content")
@@ -76,7 +76,7 @@ async def serve_file(
     uuid: str,
     request: Request,
     download: bool = False,
-    db=Depends(get_db),
+    db=Depends(get_async_db),
 ):
     service = FileService()
     record = await service.get_file(uuid, db)
@@ -134,7 +134,7 @@ async def serve_file(
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def upload_file(
     request: Request,
-    db=Depends(get_db),
+    db=Depends(get_async_db),
 ):
     service = FileService()
     form = await request.form()
@@ -151,8 +151,8 @@ async def upload_file(
             content_type=content_type,
             created_by_module="chacc_file_manager",
             channel=form.get("channel"),
+            db_session=db,
         )
-        db.commit()
         return {"uuid": record.uuid, "filename": record.filename, "size": record.size, "storage_key": record.storage_key}
     except (FileTooLargeError, InvalidContentTypeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -161,10 +161,9 @@ async def upload_file(
 @router.delete("/{uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_file(
     uuid: str,
-    db=Depends(get_db),
+    db=Depends(get_async_db),
 ):
     service = FileService()
     deleted = await service.delete_file(uuid, db)
     if not deleted:
         raise HTTPException(status_code=404, detail="File not found")
-    db.commit()
